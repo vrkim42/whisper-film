@@ -6,15 +6,21 @@ import json
 import traceback
 import platform
 import ctypes.util
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"使用设备: {device}")
 
 # 针对 Windows 环境修复 find_library('c') 返回 None 的问题
 if platform.system() == "Windows":
     original_find_library = ctypes.util.find_library
+
     def patched_find_library(name):
         result = original_find_library(name)
         if result is None and name == "c":
             return "msvcrt.dll"
         return result
+
     ctypes.util.find_library = patched_find_library
 
 from flask import Flask, request, jsonify, render_template, send_from_directory
@@ -24,6 +30,7 @@ from werkzeug.utils import secure_filename
 
 try:
     import whisper
+
     print(f"导入的 whisper 模块路径: {whisper.__file__}")
     print("Python 搜索路径:")
     for path in sys.path:
@@ -48,8 +55,17 @@ app.config.update({
     'SUBTITLES_FOLDER': 'subtitles',
     'ALLOWED_EXTENSIONS': {'mp4', 'mov', 'avi', 'mkv', 'webm'},
     'MAX_CONTENT_LENGTH': 1024 * 1024 * 1024,  # 1GB 限制
-    'MODEL_SIZE': 'base'
+    'MODEL_SIZE': 'medium'
 })
+
+# 配置全局加载的设备 
+try:
+    model = whisper.load_model(app.config['MODEL_SIZE'], device=device)
+    print(f"加载的模型： {app.config['MODEL_SIZE']} 在设备: {device}")
+except Exception as e:
+    print(f"加载 whisper 模型时出错: {e}")
+    print(traceback.format_exc())
+    raise
 
 # 初始化目录
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -63,15 +79,12 @@ except Exception as e:
     print(traceback.format_exc())
     raise
 
-
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
-
 
 @app.route('/')
 def index():
     return render_template('index.html')
-
 
 @app.route('/upload', methods=['POST'])
 def upload_video():
@@ -88,7 +101,7 @@ def upload_video():
 
         # 生成安全文件名
         filename = secure_filename(file.filename)
-        
+
         # 分块读取计算 MD5，支持大文件
         hasher = hashlib.md5()
         while True:
@@ -121,6 +134,31 @@ def upload_video():
         app.logger.error(f"文件上传或处理时发生错误: {str(e)}")
         return jsonify({'error': f'文件上传或处理时发生错误，请稍后再试。错误详情: {str(e)}'}), 500
 
+def postprocess_subtitles(segments, merge_threshold=0.5):
+    """
+    对识别的字幕片段进行合并以及简单的标点修正：
+    - 如果相邻两个片段间隔小于 merge_threshold，则将它们合并。
+    - 如果字幕文本末尾未含自然结束符，则自动添加句号。
+    """
+    if not segments:
+        return segments
+    merged = []
+    current = segments[0]
+    for seg in segments[1:]:
+        # 如果当前片段结束与下个片段开始间隔小于阈值，则合并
+        if seg['start'] - current['end'] < merge_threshold:
+            current['text'] = current['text'].strip() + " " + seg['text'].strip()
+            current['end'] = seg['end']
+        else:
+            merged.append(current)
+            current = seg
+    merged.append(current)
+    # 添加简单标点修正：如果一句话结尾没有标点则补充句号
+    for seg in merged:
+        if seg['text'] and seg['text'][-1] not in ".。!?":
+            seg['text'] += "。"
+    return merged
+
 
 def generate_subtitles(video_path):
     try:
@@ -140,6 +178,8 @@ def generate_subtitles(video_path):
         # 如果字幕文件不存在则生成，否则直接读取缓存文件
         if not os.path.exists(subtitles_path):
             result = model.transcribe(video_path)
+            # 对识别结果进行 NLP 后处理，合并短间隔字幕和修正标点
+            result['segments'] = postprocess_subtitles(result.get('segments', []))
             with open(subtitles_path, 'w', encoding='utf-8') as f:
                 json.dump({
                     'segments': result['segments'],

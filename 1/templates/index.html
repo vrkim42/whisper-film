@@ -19,6 +19,7 @@
             width: 100%;
             height: 100%;
         }
+        /* 加入渐变效果以及淡入淡出过渡 */
         #subtitles {
             position: absolute;
             bottom: 10%;
@@ -32,6 +33,8 @@
             padding: 10px 20px;
             border-radius: 5px;
             max-width: 80%;
+            opacity: 0;
+            transition: opacity 0.5s ease-in-out;
         }
         .upload-section {
             margin: 20px 0;
@@ -96,7 +99,8 @@
         let currentFilename = '';
         let currentSubtitle = { start: 0, end: 0, text: '' };
         let lastRequestTime = 0;
-        const requestInterval = 0.3; // 间隔时间（秒）
+        const requestInterval = 0.3; // 节流间隔（秒）
+        const gracePeriod = 0.3;  // 增加 0.3s 宽限期，确保字幕请求在视频播放时不会遗漏
 
         uploadInput.addEventListener('change', async function (e) {
             const file = e.target.files[0];
@@ -107,13 +111,11 @@
             try {
                 const formData = new FormData();
                 formData.append('video', file);
-
                 const xhr = new XMLHttpRequest();
                 xhr.upload.addEventListener('progress', e => {
                     const percent = (e.loaded / e.total) * 100;
                     progressBar.style.width = `${percent}%`;
                 });
-
                 xhr.open('POST', '/upload', true);
                 xhr.onreadystatechange = async function () {
                     if (xhr.readyState === 4) {
@@ -140,43 +142,45 @@
         });
 
         function initWebSocket(filename) {
-            if (socket) socket.disconnect();
-
-            socket = io();
-            socket.on('connect', () => {
-                console.log('Connected to server');
-            });
-
-            socket.on('new_subtitle', data => {
-                const currentTime = videoPlayer.currentTime;
-                // 只显示当前时间范围内字幕
-                if (currentTime >= data.start && currentTime < data.end) {
+        if (socket) socket.disconnect();
+        socket = io();
+        socket.on('connect', () => {
+            console.log('Connected to server');
+        });
+        socket.on('new_subtitle', data => {
+            const currentTime = videoPlayer.currentTime;
+            // 如果当前播放时间处于字幕显示区间，加上额外宽限期
+            if (currentTime >= data.start && currentTime < data.end + gracePeriod) {
+                if (data.text !== currentSubtitle.text) {
                     subtitles.textContent = data.text;
+                    subtitles.style.opacity = 1;
                     currentSubtitle = { start: data.start, end: data.end, text: data.text };
-                } else if (currentTime < data.start || currentTime >= data.end) {
-                    subtitles.textContent = '';
-                    currentSubtitle = { start: 0, end: 0, text: '' };
                 }
-            });
-
-            socket.on('subtitles_error', err => {
-                alert(`字幕错误: ${err.error}`);
-            });
-
-            videoPlayer.addEventListener('timeupdate', () => {
-                const currentTime = videoPlayer.currentTime;
-                if (currentTime - lastRequestTime > requestInterval) {
-                    socket.emit('request_subtitles', { filename, current_time: currentTime });
-                    lastRequestTime = currentTime;
-                }
-            });
-
-            videoPlayer.addEventListener('seeked', () => {
-                const currentTime = videoPlayer.currentTime;
-                socket.emit('request_subtitles', { filename: currentFilename, current_time: currentTime });
+            } else if (currentSubtitle.text && currentTime < currentSubtitle.end + gracePeriod) {
+                // 当前字幕仍在宽限期内，保持不变
+            } else {
+                // 超出字幕显示及宽限期后隐藏
+                subtitles.style.opacity = 0;
+                currentSubtitle = { start: 0, end: 0, text: '' };
+            }
+        });
+        socket.on('subtitles_error', err => {
+            alert(`字幕错误: ${err.error}`);
+        });
+        // 节流处理 timeupdate 和 seeked 请求
+        videoPlayer.addEventListener('timeupdate', () => {
+            const currentTime = videoPlayer.currentTime;
+            if (currentTime - lastRequestTime > requestInterval) {
+                socket.emit('request_subtitles', { filename, current_time: currentTime });
                 lastRequestTime = currentTime;
-            });
-        }
+            }
+        });
+        videoPlayer.addEventListener('seeked', () => {
+            const currentTime = videoPlayer.currentTime;
+            socket.emit('request_subtitles', { filename: currentFilename, current_time: currentTime });
+            lastRequestTime = currentTime;
+        });
+    }
     </script>
 </body>
 </html>
