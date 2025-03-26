@@ -8,19 +8,20 @@ import platform
 import ctypes.util
 import torch
 
+# 设置 CUDA 分配配置，减少内存碎片问题
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"使用设备: {device}")
 
 # 针对 Windows 环境修复 find_library('c') 返回 None 的问题
 if platform.system() == "Windows":
     original_find_library = ctypes.util.find_library
-
     def patched_find_library(name):
         result = original_find_library(name)
         if result is None and name == "c":
             return "msvcrt.dll"
         return result
-
     ctypes.util.find_library = patched_find_library
 
 from flask import Flask, request, jsonify, render_template, send_from_directory
@@ -30,7 +31,6 @@ from werkzeug.utils import secure_filename
 
 try:
     import whisper
-
     print(f"导入的 whisper 模块路径: {whisper.__file__}")
     print("Python 搜索路径:")
     for path in sys.path:
@@ -44,7 +44,7 @@ except Exception as e:
     print(traceback.format_exc())
     raise
 
-# 初始化应用
+# 初始化 Flask 应用和 SocketIO
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -58,10 +58,10 @@ app.config.update({
     'MODEL_SIZE': 'medium'
 })
 
-# 配置全局加载的设备 
+# 全局加载模型（只加载一次）
 try:
     model = whisper.load_model(app.config['MODEL_SIZE'], device=device)
-    print(f"加载的模型： {app.config['MODEL_SIZE']} 在设备: {device}")
+    print(f"加载的模型: {app.config['MODEL_SIZE']} 在设备: {device}")
 except Exception as e:
     print(f"加载 whisper 模型时出错: {e}")
     print(traceback.format_exc())
@@ -70,14 +70,6 @@ except Exception as e:
 # 初始化目录
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['SUBTITLES_FOLDER'], exist_ok=True)
-
-# 全局加载模型
-try:
-    model = whisper.load_model(app.config['MODEL_SIZE'])
-except Exception as e:
-    print(f"加载 whisper 模型时出错: {e}")
-    print(traceback.format_exc())
-    raise
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
@@ -99,10 +91,8 @@ def upload_video():
         if not allowed_file(file.filename):
             return jsonify({'error': '不支持的文件类型'}), 400
 
-        # 生成安全文件名
+        # 生成安全文件名及计算 MD5（支持大文件分块读取）
         filename = secure_filename(file.filename)
-
-        # 分块读取计算 MD5，支持大文件
         hasher = hashlib.md5()
         while True:
             chunk = file.read(8192)
@@ -110,15 +100,10 @@ def upload_video():
                 break
             hasher.update(chunk)
         file_hash = hasher.hexdigest()
-        # 重置文件指针，确保后续 file.save 正常工作
         file.seek(0)
-
-        # 保存文件
         save_filename = f"{file_hash}_{filename}"
         video_path = os.path.join(app.config['UPLOAD_FOLDER'], save_filename)
         file.save(video_path)
-
-        # 检查文件是否存在
         if not os.path.exists(video_path):
             raise RuntimeError(f"文件保存失败: {video_path} 不存在")
 
@@ -137,15 +122,14 @@ def upload_video():
 def postprocess_subtitles(segments, merge_threshold=0.5):
     """
     对识别的字幕片段进行合并以及简单的标点修正：
-    - 如果相邻两个片段间隔小于 merge_threshold，则将它们合并。
-    - 如果字幕文本末尾未含自然结束符，则自动添加句号。
+      - 如果相邻两个片段间隔小于 merge_threshold，则将它们合并。
+      - 如果字幕文本末尾未含自然结束符，则自动添加句号。
     """
     if not segments:
         return segments
     merged = []
     current = segments[0]
     for seg in segments[1:]:
-        # 如果当前片段结束与下个片段开始间隔小于阈值，则合并
         if seg['start'] - current['end'] < merge_threshold:
             current['text'] = current['text'].strip() + " " + seg['text'].strip()
             current['end'] = seg['end']
@@ -153,32 +137,25 @@ def postprocess_subtitles(segments, merge_threshold=0.5):
             merged.append(current)
             current = seg
     merged.append(current)
-    # 添加简单标点修正：如果一句话结尾没有标点则补充句号
     for seg in merged:
         if seg['text'] and seg['text'][-1] not in ".。!?":
             seg['text'] += "。"
     return merged
 
-
 def generate_subtitles(video_path):
     try:
         app.logger.info(f"Generating subtitles for video: {video_path}")
-
-        # 生成唯一字幕文件名
         file_hash = os.path.basename(video_path).split('_')[0]
         subtitles_filename = f"{file_hash}.json"
         subtitles_path = os.path.join(app.config['SUBTITLES_FOLDER'], subtitles_filename)
 
-        # 检查视频文件是否存在
         if not os.path.exists(video_path):
             raise RuntimeError(f"视频文件不存在: {video_path}")
 
         app.logger.info(f"Video file exists: {video_path}")
 
-        # 如果字幕文件不存在则生成，否则直接读取缓存文件
         if not os.path.exists(subtitles_path):
             result = model.transcribe(video_path)
-            # 对识别结果进行 NLP 后处理，合并短间隔字幕和修正标点
             result['segments'] = postprocess_subtitles(result.get('segments', []))
             with open(subtitles_path, 'w', encoding='utf-8') as f:
                 json.dump({
@@ -190,7 +167,6 @@ def generate_subtitles(video_path):
                 result = json.load(f)
 
         app.logger.info(f"Subtitles generated: {subtitles_path}")
-
         return {
             'filename': subtitles_filename,
             'duration': result['segments'][-1]['end'] if result['segments'] else 0
@@ -199,16 +175,13 @@ def generate_subtitles(video_path):
     except Exception as e:
         raise RuntimeError(f"字幕生成失败: {str(e)}")
 
-
 @app.route('/media/<filename>')
 def serve_media(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-
 @socketio.on('connect')
 def handle_connect():
     emit('connection_status', {'status': 'connected'})
-
 
 @socketio.on('request_subtitles')
 def handle_request_subtitles(data):
@@ -223,11 +196,9 @@ def handle_request_subtitles(data):
 
         start_time = time.time()
         current_index = 0
-
         while current_index < len(subtitles['segments']):
             elapsed = time.time() - start_time
             segment = subtitles['segments'][current_index]
-
             if elapsed >= segment['start']:
                 emit('new_subtitle', {
                     'text': segment['text'],
@@ -238,10 +209,8 @@ def handle_request_subtitles(data):
                 current_index += 1
             else:
                 socketio.sleep(0.1)
-
     except Exception as e:
         emit('subtitles_error', {'error': str(e)})
-
 
 if __name__ == '__main__':
     socketio.run(app, host='127.0.0.1', port=8848, debug=True, allow_unsafe_werkzeug=True)
