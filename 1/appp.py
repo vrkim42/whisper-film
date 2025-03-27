@@ -58,7 +58,7 @@ app.config.update({
     'MODEL_SIZE': 'medium'
 })
 
-# 全局加载模型（只加载一次），传入 device 参数
+# 全局加载模型（只加载一次）
 try:
     model = whisper.load_model(app.config['MODEL_SIZE'], device=device)
     print(f"加载的模型: {app.config['MODEL_SIZE']} 在设备: {device}")
@@ -119,10 +119,10 @@ def upload_video():
         app.logger.error(f"文件上传或处理时发生错误: {str(e)}")
         return jsonify({'error': f'文件上传或处理时发生错误，请稍后再试。错误详情: {str(e)}'}), 500
 
-def postprocess_subtitles(segments, merge_threshold=0.5):
+def postprocess_subtitles(segments, merge_threshold=0.2):
     """
     对识别的字幕片段进行合并以及简单的标点修正：
-      - 如果相邻两个片段间隔小于 merge_threshold，则将它们合并。
+      - 如果相邻两个片段间隔小于 merge_threshold，则将它们合并；
       - 如果字幕文本末尾未含自然结束符，则自动添加句号。
     """
     if not segments:
@@ -154,24 +154,30 @@ def generate_subtitles(video_path):
 
         app.logger.info(f"Video file exists: {video_path}")
 
-        if not os.path.exists(subtitles_path):
-            result = model.transcribe(video_path)
-            result['segments'] = postprocess_subtitles(result.get('segments', []))
-            with open(subtitles_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'segments': result['segments'],
-                    'duration': result['segments'][-1]['end'] if result['segments'] else 0
-                }, f, ensure_ascii=False)
-        else:
-            with open(subtitles_path, 'r', encoding='utf-8') as f:
-                result = json.load(f)
+        # 调用全局加载的 whisper 模型进行音频转录
+        result = model.transcribe(video_path)
+        segments = result.get("segments", [])
+        if not segments:
+            raise RuntimeError("未获取到字幕片段。")
+
+        # 保存未经合并处理的原始分段数据，保留较精细的时间戳（避免时间间隔过长）
+        with open(subtitles_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'segments': segments,
+                'duration': segments[-1]['end']
+            }, f, ensure_ascii=False)
+
+        # 生成 TXT 文章文件（将所有字幕文本合并为一段）
+        article_text = " ".join(seg["text"].strip() for seg in segments)
+        article_path = os.path.join(app.config['SUBTITLES_FOLDER'], f"{file_hash}.txt")
+        with open(article_path, 'w', encoding='utf-8') as f:
+            f.write(article_text.strip())
 
         app.logger.info(f"Subtitles generated: {subtitles_path}")
         return {
             'filename': subtitles_filename,
-            'duration': result['segments'][-1]['end'] if result['segments'] else 0
+            'duration': segments[-1]['end']
         }
-
     except Exception as e:
         raise RuntimeError(f"字幕生成失败: {str(e)}")
 
@@ -200,12 +206,51 @@ def handle_request_subtitles(data):
             elapsed = time.time() - start_time
             segment = subtitles['segments'][current_index]
             if elapsed >= segment['start']:
+                # 发出新字幕事件，显示当前一句
                 emit('new_subtitle', {
                     'text': segment['text'],
                     'start': segment['start'],
                     'end': segment['end'],
                     'duration': segment['end'] - segment['start']
                 })
+                # 等待当前字幕的显示时间，期间暂停执行
+                display_duration = segment['end'] - segment['start']
+                socketio.sleep(display_duration)
+                # 清除已经显示的字幕，让屏幕只保留一句
+                emit('new_subtitle', {'text': ''})
+                current_index += 1
+            else:
+                socketio.sleep(0.1)
+    except Exception as e:
+        emit('subtitles_error', {'error': str(e)})@socketio.on('request_subtitles')
+def handle_request_subtitles(data):
+    try:
+        subtitles_path = os.path.join(app.config['SUBTITLES_FOLDER'], data['filename'])
+        if not os.path.exists(subtitles_path):
+            emit('subtitles_error', {'error': '字幕文件不存在'})
+            return
+
+        with open(subtitles_path, 'r', encoding='utf-8') as f:
+            subtitles = json.load(f)
+
+        start_time = time.time()
+        current_index = 0
+        while current_index < len(subtitles['segments']):
+            elapsed = time.time() - start_time
+            segment = subtitles['segments'][current_index]
+            if elapsed >= segment['start']:
+                # 发出新字幕事件，显示当前一句
+                emit('new_subtitle', {
+                    'text': segment['text'],
+                    'start': segment['start'],
+                    'end': segment['end'],
+                    'duration': segment['end'] - segment['start']
+                })
+                # 等待当前字幕的显示时间，期间暂停执行
+                display_duration = segment['end'] - segment['start']
+                socketio.sleep(display_duration)
+                # 清除已经显示的字幕，让屏幕只保留一句
+                emit('new_subtitle', {'text': ''})
                 current_index += 1
             else:
                 socketio.sleep(0.1)
