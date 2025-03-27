@@ -58,7 +58,7 @@ app.config.update({
     'MODEL_SIZE': 'medium'
 })
 
-# 全局加载模型（只加载一次）
+# 全局加载模型（只加载一次），传入 device 参数
 try:
     model = whisper.load_model(app.config['MODEL_SIZE'], device=device)
     print(f"加载的模型: {app.config['MODEL_SIZE']} 在设备: {device}")
